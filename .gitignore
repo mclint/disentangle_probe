@@ -1,0 +1,16 @@
+# Activation banks
+bank_*/
+qwen_*/
+
+# Probe results
+results/*.jsonl
+
+# Python
+__pycache__/
+*.pyc
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/

@@ -1,0 +1,5 @@
+[{"role":"system","content":"You are a precise and helpful assistant."},{"role":"user","content":"Explain why the sky appears blue in 3 short sentences."}]
+[{"role":"system","content":"You are a concise assistant."},{"role":"user","content":"What is the capital of France?"}]
+[{"role":"system","content":"You solve math carefully."},{"role":"user","content":"Solve step by step: If 3x + 5 = 20, what is x?"}]
+[{"role":"system","content":"You are a coding assistant."},{"role":"user","content":"Write a Python function that returns the factorial of a non-negative integer."}]
+[{"role":"system","content":"You are a reasoning assistant."},{"role":"user","content":"A farmer has 17 sheep and all but 9 run away. How many are left?"}]
