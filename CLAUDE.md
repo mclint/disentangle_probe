@@ -58,6 +58,10 @@ python probe_states.py --model Qwen/Qwen2.5-1.5B --prompts_file prompts.txt \
 
 torch, transformers, faiss-cpu, numpy, jupyter, plotly, matplotlib, pandas
 
+## Keeping docs in sync
+
+When changing CLI flags, output schema, or adding new scripts, update both `README.md` and `CLAUDE.md` to match.
+
 ## Common flags
 
 - `--normalize_bank` + `--normalize_queries`: use cosine similarity (both must be set)
