@@ -4,7 +4,7 @@ This package measures **hidden-state disentanglement** in Hugging Face causal LM
 
 ## Files
 
-- `build_bank.py` — builds per-layer activation bank (.pt tensors + .faiss indices)
+- `build_bank.py` — builds per-layer activation bank (`.memmap` tensors + `.faiss` indices)
 - `probe_states.py` — probes prefill/decode states against the bank (standard attention models)
 - `probe_states_hybrid.py` — same as above but handles hybrid attention (e.g. Qwen 3.5 with mixed full/linear attention layers)
 - `common.py` — shared utilities: model loading, FAISS wrappers, prompt preparation, attention summarisation, output writing
@@ -35,7 +35,7 @@ We retain both:
 ## Installation
 
 ```bash
-pip install torch transformers faiss-cpu numpy jupyter plotly matplotlib pandas
+pip install torch transformers tensordict faiss-cpu numpy jupyter plotly matplotlib pandas
 ```
 
 ## Device loading
@@ -63,8 +63,9 @@ python build_bank.py \
 
 This writes:
 
-- `layer_<L>.pt` raw bank tensors
+- `layer_<L>.memmap` raw bank tensors
 - `layer_<L>.faiss` FAISS indices
+- `bank_meta.json` shape/dtype metadata for reopening memmapped banks
 
 Use `--skip_save_tensors` or `--skip_save_faiss` to omit either output.
 
@@ -176,7 +177,7 @@ python probe_states_hybrid.py \
 
 - For cosine similarity, use both `--normalize_bank` and `--normalize_queries`.
 - With `--use_faiss`, probing uses the saved `.faiss` files when present.
-- If only raw `.pt` bank tensors exist, the probe scripts can still build in-memory FAISS indices.
+- Probe scripts can read new raw `.memmap` bank files as well as legacy `.npy` and `.pt` bank files.
 - Attention summaries are only available for layers >= 1 (standard models) or full-attention layers (hybrid models).
 - Template-control detection is best-effort and assumes message content appears verbatim in the rendered chat template.
 

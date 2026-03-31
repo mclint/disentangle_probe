@@ -17,11 +17,13 @@ from common import (
     is_special_token_id,
     jsonl_write,
     knn_top1_and_true_rank,
+    load_bank_tensor,
+    load_bank_vectors_for_faiss,
     load_model_and_tokenizer,
     maybe_normalize,
     prepare_prompt_examples,
     print_summary,
-    to_numpy_f32,
+    resolve_bank_path,
     validate_layers,
 )
 
@@ -60,7 +62,7 @@ class ActivationBank:
         self.faiss_indices: Dict[int, FaissLayerIndex] = {}
 
     def bank_path(self, layer: int) -> Path:
-        return self.bank_dir / f"layer_{layer}.pt"
+        return resolve_bank_path(self.bank_dir, layer)
 
     def faiss_path(self, layer: int) -> Path:
         return self.bank_dir / f"layer_{layer}.faiss"
@@ -78,12 +80,11 @@ class ActivationBank:
                 if fpath.exists():
                     self.faiss_indices[layer] = FaissLayerIndex(faiss.read_index(str(fpath)), use_cosine=use_cosine)
                 else:
-                    tensor = torch.load(self.bank_path(layer), map_location="cpu")
-                    self.bank_tensors[layer] = tensor.to(device)
-                    self.faiss_indices[layer] = FaissLayerIndex(build_faiss_index(to_numpy_f32(tensor), use_cosine=use_cosine), use_cosine=use_cosine)
+                    vectors = load_bank_vectors_for_faiss(self.bank_dir, layer)
+                    self.faiss_indices[layer] = FaissLayerIndex(build_faiss_index(vectors, use_cosine=use_cosine), use_cosine=use_cosine)
         else:
             self.bank_tensors = {
-                layer: torch.load(self.bank_path(layer), map_location=device)
+                layer: load_bank_tensor(self.bank_dir, layer, device)
                 for layer in self.layers
             }
 

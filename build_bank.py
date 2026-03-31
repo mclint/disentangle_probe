@@ -7,8 +7,11 @@ from typing import Dict, Sequence
 
 import torch
 torch.set_float32_matmul_precision('high')
+from tensordict import MemoryMappedTensor
 
 from common import (
+    bank_memmap_path,
+    bank_metadata_path,
     batch_iter,
     build_faiss_index,
     ensure_dir,
@@ -16,11 +19,10 @@ from common import (
     hidden_size_from_model,
     load_model_and_tokenizer,
     maybe_normalize,
-    to_numpy_f32,
+    save_bank_metadata,
     validate_layers,
     num_hidden_state_slots,
 )
-
 import numpy as np
 import random
 import os
@@ -49,27 +51,46 @@ set_seed(42)
 
 
 class ActivationBank:
-    def __init__(self, bank_dir: str, layers: Sequence[int]):
+    def __init__(self, bank_dir: str, layers: Sequence[int], dtype: torch.dtype):
         self.bank_dir = Path(bank_dir)
         self.layers = list(layers)
-        self.bank_tensors: Dict[int, torch.Tensor] = {}
+        self.dtype = dtype
+        self.bank_arrays: Dict[int, torch.Tensor] = {}
 
     def bank_path(self, layer: int) -> Path:
-        return self.bank_dir / f"layer_{layer}.pt"
+        return bank_memmap_path(self.bank_dir, layer)
 
     def faiss_path(self, layer: int) -> Path:
         return self.bank_dir / f"layer_{layer}.faiss"
 
+    def initialize(self, vocab_size: int, d_model: int) -> None:
+        ensure_dir(self.bank_dir)
+        save_bank_metadata(self.bank_dir, vocab_size, d_model, self.dtype, self.layers)
+        self.bank_arrays = {
+            layer: MemoryMappedTensor.empty(
+                (vocab_size, d_model),
+                dtype=self.dtype,
+                filename=self.bank_path(layer),
+                existsok=True,
+            )
+            for layer in self.layers
+        }
+
     def save(self, save_tensors: bool = True, save_faiss: bool = True, use_cosine: bool = False) -> None:
         ensure_dir(self.bank_dir)
-        if save_tensors:
-            for layer, tensor in self.bank_tensors.items():
-                torch.save(tensor.to(torch.float32).cpu(), self.bank_path(layer))
         if save_faiss:
             import faiss
-            for layer, tensor in self.bank_tensors.items():
-                index = build_faiss_index(to_numpy_f32(tensor), use_cosine=use_cosine)
+            for layer, array in self.bank_arrays.items():
+                index = build_faiss_index(array, use_cosine=use_cosine)
                 faiss.write_index(index, str(self.faiss_path(layer)))
+        if not save_tensors:
+            for layer in self.layers:
+                path = self.bank_path(layer)
+                if path.exists():
+                    path.unlink()
+            meta_path = bank_metadata_path(self.bank_dir)
+            if meta_path.exists():
+                meta_path.unlink()
 
 
 def parse_args() -> argparse.Namespace:
@@ -96,14 +117,29 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def resolve_anchor_id(args: argparse.Namespace, tokenizer) -> tuple[int, str]:
+    if args.anchor_token_id is not None:
+        return int(args.anchor_token_id), "argument --anchor_token_id"
+
+    for attr in ("bos_token_id", "cls_token_id", "eos_token_id", "pad_token_id"):
+        token_id = getattr(tokenizer, attr, None)
+        if token_id is not None:
+            return int(token_id), f"tokenizer.{attr}"
+
+    raise ValueError(
+        "Could not determine a default anchor token id from the tokenizer. "
+        "Please pass --anchor_token_id explicitly."
+    )
+
+
 @torch.no_grad()
 def main() -> None:
     args = parse_args()
     model, tokenizer = load_model_and_tokenizer(args)
 
-    anchor_id = args.anchor_token_id if args.anchor_token_id is not None else tokenizer.bos_token_id
+    anchor_id, anchor_source = resolve_anchor_id(args, tokenizer)
     anchor_text = tokenizer.convert_ids_to_tokens(anchor_id)
-    print(f"Anchor token: id={anchor_id} text={anchor_text!r}")
+    print(f"Anchor token selected from {anchor_source}: id={anchor_id} text={anchor_text!r}")
 
     if args.layers is None:
         args.layers = list(range(num_hidden_state_slots(model)))
@@ -112,11 +148,10 @@ def main() -> None:
 
     vocab_size = int(tokenizer.vocab_size)
     d_model = hidden_size_from_model(model)
-    bank = ActivationBank(args.bank_dir, args.layers)
-    bank.bank_tensors = {
-        l: torch.empty((vocab_size, d_model), dtype=get_dtype(args.dtype), device=args.device)
-        for l in args.layers
-    }
+    bank_dtype = get_dtype(args.dtype)
+    print(f"Raw bank storage dtype: {args.dtype}")
+    bank = ActivationBank(args.bank_dir, args.layers, dtype=bank_dtype)
+    bank.initialize(vocab_size, d_model)
 
     token_ids = list(range(vocab_size))
     for ids in batch_iter(token_ids, args.vocab_batch_size):
@@ -133,7 +168,7 @@ def main() -> None:
             # if layer > 0:
             #     vecs -= outputs.hidden_states[layer-1][:, 0, :]
             vecs = maybe_normalize(vecs, args.normalize_bank)
-            bank.bank_tensors[layer][ids] = vecs
+            bank.bank_arrays[layer][ids] = vecs.to(bank_dtype).cpu()
 
     bank.save(
         save_tensors=not args.skip_save_tensors,

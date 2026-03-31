@@ -8,6 +8,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
+from tensordict import MemoryMappedTensor
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
@@ -162,6 +163,103 @@ def to_numpy_f32(x: torch.Tensor) -> np.ndarray:
     return x.detach().to(torch.float32).cpu().contiguous().numpy().astype("float32", copy=False)
 
 
+def dtype_name(dtype: torch.dtype) -> str:
+    mapping = {
+        torch.float16: "float16",
+        torch.bfloat16: "bfloat16",
+        torch.float32: "float32",
+    }
+    if dtype not in mapping:
+        raise ValueError(f"Unsupported dtype: {dtype}")
+    return mapping[dtype]
+
+
+def bank_memmap_path(bank_dir: str | Path, layer: int) -> Path:
+    return Path(bank_dir) / f"layer_{layer}.memmap"
+
+
+def bank_npy_path(bank_dir: str | Path, layer: int) -> Path:
+    return Path(bank_dir) / f"layer_{layer}.npy"
+
+
+def bank_pt_path(bank_dir: str | Path, layer: int) -> Path:
+    return Path(bank_dir) / f"layer_{layer}.pt"
+
+
+def bank_metadata_path(bank_dir: str | Path) -> Path:
+    return Path(bank_dir) / "bank_meta.json"
+
+
+def save_bank_metadata(
+    bank_dir: str | Path,
+    vocab_size: int,
+    hidden_size: int,
+    dtype: torch.dtype,
+    layers: Sequence[int],
+) -> None:
+    payload = {
+        "shape": [int(vocab_size), int(hidden_size)],
+        "dtype": dtype_name(dtype),
+        "layers": [int(layer) for layer in layers],
+    }
+    bank_metadata_path(bank_dir).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def load_bank_metadata(bank_dir: str | Path) -> Dict[str, Any]:
+    path = bank_metadata_path(bank_dir)
+    if not path.exists():
+        raise FileNotFoundError(f"Activation bank metadata not found at {path}")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def resolve_bank_path(bank_dir: str | Path, layer: int) -> Path:
+    memmap_path = bank_memmap_path(bank_dir, layer)
+    if memmap_path.exists():
+        return memmap_path
+    npy_path = bank_npy_path(bank_dir, layer)
+    if npy_path.exists():
+        return npy_path
+    pt_path = bank_pt_path(bank_dir, layer)
+    if pt_path.exists():
+        return pt_path
+    return memmap_path
+
+
+def load_bank_tensor(bank_dir: str | Path, layer: int, device: str) -> torch.Tensor:
+    path = resolve_bank_path(bank_dir, layer)
+    if not path.exists():
+        raise FileNotFoundError(f"Activation bank for layer {layer} not found under {bank_dir}")
+    if path.suffix == ".memmap":
+        metadata = load_bank_metadata(bank_dir)
+        tensor = MemoryMappedTensor.from_filename(
+            path,
+            dtype=get_dtype(metadata["dtype"]),
+            shape=torch.Size(metadata["shape"]),
+        )
+        return tensor.to(device)
+    if path.suffix == ".npy":
+        array = np.load(path)
+        return torch.from_numpy(array).to(device)
+    return torch.load(path, map_location=device)
+
+
+def load_bank_vectors_for_faiss(bank_dir: str | Path, layer: int) -> np.ndarray | torch.Tensor:
+    path = resolve_bank_path(bank_dir, layer)
+    if not path.exists():
+        raise FileNotFoundError(f"Activation bank for layer {layer} not found under {bank_dir}")
+    if path.suffix == ".memmap":
+        metadata = load_bank_metadata(bank_dir)
+        return MemoryMappedTensor.from_filename(
+            path,
+            dtype=get_dtype(metadata["dtype"]),
+            shape=torch.Size(metadata["shape"]),
+        )
+    if path.suffix == ".npy":
+        return np.load(path, mmap_mode="r")
+    tensor = torch.load(path, map_location="cpu")
+    return to_numpy_f32(tensor)
+
+
 class FaissLayerIndex:
     def __init__(self, index, use_cosine: bool):
         self.index = index
@@ -179,7 +277,7 @@ class FaissLayerIndex:
         return nn_id, score, rank_true
 
 
-def build_faiss_index(vectors: np.ndarray, use_cosine: bool):
+def build_faiss_index(vectors: np.ndarray | torch.Tensor, use_cosine: bool, add_batch_size: int = 16384):
     import faiss
 
     dim = int(vectors.shape[1])
@@ -187,7 +285,14 @@ def build_faiss_index(vectors: np.ndarray, use_cosine: bool):
         index = faiss.IndexFlatIP(dim)
     else:
         index = faiss.IndexFlatL2(dim)
-    index.add(vectors)
+    total = int(vectors.shape[0])
+    for start in range(0, total, add_batch_size):
+        batch_vectors = vectors[start : start + add_batch_size]
+        if torch.is_tensor(batch_vectors):
+            batch = to_numpy_f32(batch_vectors)
+        else:
+            batch = np.asarray(batch_vectors, dtype="float32")
+        index.add(batch)
     return index
 
 

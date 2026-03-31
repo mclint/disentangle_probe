@@ -1,6 +1,5 @@
 # Activation banks
-bank_*/
-qwen_*/
+banks/*
 
 # Probe results
 results/*.jsonl
@@ -14,3 +13,7 @@ __pycache__/
 
 # IDE
 .vscode/
+
+# AI
+.claude/
+.codex
