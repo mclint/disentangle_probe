@@ -9,7 +9,7 @@ This package measures **hidden-state disentanglement** in Hugging Face causal LM
 - `probe_states.py` — probes prefill/decode states against the bank (standard attention models)
 - `probe_states_hybrid.py` — same as above but handles hybrid attention (e.g. Qwen 3.5 with mixed full/linear attention layers)
 - `common.py` — shared utilities: model loading, FAISS wrappers, prompt preparation, attention summarisation, output writing
-- `analyze_results.ipynb` — analysis and visualisation notebook
+- `notebooks/` — project notebooks, including `analyze_results.ipynb`, `debug.ipynb`, and `context_bank_diagnostics.ipynb`
 
 ## Layer convention
 
@@ -65,10 +65,11 @@ python build_bank.py \
 This writes:
 
 - `layer_<L>.memmap` raw bank tensors
-- `layer_<L>.faiss` FAISS indices
-- `bank_meta.json` shape/dtype metadata for reopening memmapped banks
+- `layer_<L>.faiss` optional FAISS indices for one metric (`l2` or `cosine`)
+- `bank_meta.json` shape/dtype metadata plus `tensor_storage` / `faiss_metric`
 
 Use `--skip_save_tensors` or `--skip_save_faiss` to omit either output.
+`--normalize_bank` in `build_bank.py` no longer normalizes stored tensors; it only builds cosine-compatible `.faiss` indices while the on-disk bank remains raw.
 
 ## Build a contextualized bank from chat datasets
 
@@ -174,6 +175,54 @@ Outputs under `--out_dir`:
 - `cluster_variance`
 
 Low-support tokens still get a codebook row; when a token has fewer than `--codebook_min_count` examples, its codebook collapses to a single cluster equal to the token-level mean/variance.
+`meta.json` also records the contextual artifact `state_space` (`raw` or `normalized`).
+
+Unlike the dense vocab bank, contextualized-bank normalization cannot be deferred until load time: if `--normalize_states` is set, the builder aggregates normalized hidden states directly, so the saved sparse means/codebooks live in normalized space.
+
+Use `notebooks/context_bank_diagnostics.ipynb` after a run to inspect token-count coverage, active-cluster usage, cluster occupancy balance, and simple heuristics for tuning `codebook_k` / `codebook_min_count`.
+
+## Evaluate residual reconstruction
+
+`evaluate_residuals.py` measures hidden-state reconstruction quality for three baselines on a held-out split of a chat-style dataset:
+
+- prototype-only: `P_l[x_t]`
+- prototype + shared residual codebook
+- prototype + low-rank residual PCA
+
+It reuses the prototype bank from `build_bank.py`, fits residual models on a fit split, and reports compact per-layer metrics on a disjoint eval split.
+
+Example:
+
+```bash
+python evaluate_residuals.py \
+  --model Qwen/Qwen2.5-1.5B-Instruct \
+  --hf_dataset HuggingFaceH4/capybara \
+  --hf_split train_sft \
+  --bank_dir ./bank_qwen25_15b \
+  --distribution_config ./configs/distributions.content_only.json \
+  --out_dir ./residual_eval_qwen25 \
+  --layers 0 1 8 16 24 \
+  --batch_size 4 \
+  --fit_fraction 0.8 \
+  --codebook_k 8 \
+  --pca_rank 8 \
+  --normalize_bank \
+  --normalize_states \
+  --device cuda:0
+```
+
+Outputs under `--out_dir`:
+
+- `summary.json` — nested per-distribution/per-layer metrics plus run metadata
+- `layer_metrics.csv` — one flat row per `distribution x layer x baseline`
+
+Reported metrics for each baseline include:
+
+- token count
+- cosine mean and median
+- mean per-dimension MSE
+- explained variance
+- multi-threshold coverage for cosine similarity and per-dimension MSE
 
 ## Probe raw-text prompts (standard model)
 
@@ -266,8 +315,9 @@ python probe_states_hybrid.py \
 
 | Flag | Description |
 |------|-------------|
-| `--normalize_bank` + `--normalize_queries` | Use cosine similarity (both must be set) |
-| `--use_faiss` | Use `.faiss` index files for fast NN search |
+| `--normalize_bank` + `--normalize_queries` | Use cosine similarity in probing; raw bank tensors are normalized at probe time when needed |
+| `--normalize_bank` + `--normalize_states` | Use cosine-space prototypes in `evaluate_residuals.py`; raw bank tensors are normalized at eval time when needed |
+| `--use_faiss` | Use saved `.faiss` indices when their recorded metric matches, otherwise rebuild an in-memory index from the raw bank |
 | `--collect_attention_stats` | Extract attention entropy, top-k mass, recency, BOS mass, etc. |
 | `--prompt_format chat` + `--add_generation_prompt` | For chat-templated prompts (JSONL input) |
 | `--trust_remote_code` | Required for some model architectures |
@@ -277,23 +327,31 @@ python probe_states_hybrid.py \
 | `--topk_true_rank` | How many top-k neighbours to search for the true token's rank (default: `10`) |
 | `--max_prompts` | Limit number of prompts to process |
 | `--anchor_token_id` | Override anchor token for `build_bank.py` (default: BOS token) |
-| `--skip_save_tensors` / `--skip_save_faiss` | Omit `.pt` or `.faiss` output in `build_bank.py` |
+| `--skip_save_tensors` / `--skip_save_faiss` | Omit `.memmap` or `.faiss` output in `build_bank.py` |
 | `--distribution_config` | JSON config describing named token distributions for `build_contextual_bank.py` |
 | `--dataset_file` / `--hf_dataset` | Choose exactly one contextual-bank dataset source: local chat JSONL or Hugging Face dataset |
 | `--hf_split` / `--hf_revision` / `--hf_streaming` | Hugging Face dataset source controls for `build_contextual_bank.py` |
 | `--normalize_states` | L2-normalize contextualized states before stats/codebook aggregation |
 | `--codebook_k` / `--codebook_min_count` | Control fixed-`K` codebook size and low-count fallback threshold |
+| `--fit_fraction` | Fraction of examples used to fit residual codebooks/PCA in `evaluate_residuals.py` |
+| `--pca_rank` | Low-rank residual dimension for `evaluate_residuals.py` |
+| `--coverage_cosine_thresholds` / `--coverage_mse_thresholds` | Coverage thresholds for residual reconstruction summaries |
 
 ## Notes
 
-- For cosine similarity, use both `--normalize_bank` and `--normalize_queries`.
-- With `--use_faiss`, probing uses the saved `.faiss` files when present.
+- Banks are always stored raw on disk, even when `build_bank.py --normalize_bank` is set.
+- For cosine similarity in probing, use both `--normalize_bank` and `--normalize_queries`.
+- For residual evaluation, use both `--normalize_bank` and `--normalize_states`, or neither.
+- With `--use_faiss`, probing reuses the saved `.faiss` files only when `bank_meta.json` records a matching metric; otherwise it rebuilds from the raw bank.
+- Legacy banks with old metadata are treated as raw tensor storage. Legacy `.faiss` files without recorded metric metadata are ignored and rebuilt when raw bank tensors are available.
 - Probe scripts can read new raw `.memmap` bank files as well as legacy `.npy` and `.pt` bank files.
 - Attention summaries are only available for layers >= 1 (standard models) or full-attention layers (hybrid models).
 - Template-control detection is best-effort and assumes message content appears verbatim in the rendered chat template.
 - Contextualized banks are sparse over observed dataset tokens only; they do not allocate dense `[vocab, ...]` tensors.
 - `build_contextual_bank.py` currently aggregates prefill states only and is intended for chat-style instruct datasets.
+- Contextualized-bank artifacts are aggregate summaries, not raw state dumps, so `--normalize_states` changes the stored artifacts themselves and cannot be reproduced exactly with post-hoc normalization.
 - When loading from Hugging Face, the current implementation expects rows that already expose OpenAI-style `messages` with `role` and `content` fields, as in `HuggingFaceH4/capybara`.
+- `evaluate_residuals.py` is a hidden-state fidelity benchmark only; it does not yet run downstream substitution or perplexity tests.
 
 ## Output schema
 

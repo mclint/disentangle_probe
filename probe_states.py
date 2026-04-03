@@ -14,6 +14,7 @@ from common import (
     PromptExample,
     build_faiss_index,
     decode_token,
+    faiss_metric_name,
     is_special_token_id,
     jsonl_write,
     knn_top1_and_true_rank,
@@ -24,6 +25,7 @@ from common import (
     prepare_prompt_examples,
     print_summary,
     resolve_bank_path,
+    saved_faiss_metric,
     validate_layers,
 )
 
@@ -75,16 +77,36 @@ class ActivationBank:
         self.faiss_indices = {}
         if use_faiss:
             import faiss
+            requested_metric = faiss_metric_name(use_cosine)
+            recorded_metric = saved_faiss_metric(self.bank_dir)
             for layer in self.layers:
                 fpath = self.faiss_path(layer)
-                if fpath.exists():
+                if fpath.exists() and recorded_metric == requested_metric:
                     self.faiss_indices[layer] = FaissLayerIndex(faiss.read_index(str(fpath)), use_cosine=use_cosine)
                 else:
-                    vectors = load_bank_vectors_for_faiss(self.bank_dir, layer)
+                    if fpath.exists():
+                        if recorded_metric is None:
+                            print(
+                                f"Saved FAISS index for layer {layer} has no recorded metric; "
+                                "rebuilding from raw bank tensors."
+                            )
+                        else:
+                            print(
+                                f"Saved FAISS index for layer {layer} uses metric {recorded_metric!r}, "
+                                f"not requested {requested_metric!r}; rebuilding from raw bank tensors."
+                            )
+                    try:
+                        vectors = load_bank_vectors_for_faiss(self.bank_dir, layer)
+                    except FileNotFoundError as exc:
+                        raise FileNotFoundError(
+                            f"Could not rebuild FAISS index for layer {layer}: raw bank tensors are missing "
+                            f"under {self.bank_dir}, and the saved index is not reusable for metric "
+                            f"{requested_metric!r}."
+                        ) from exc
                     self.faiss_indices[layer] = FaissLayerIndex(build_faiss_index(vectors, use_cosine=use_cosine), use_cosine=use_cosine)
         else:
             self.bank_tensors = {
-                layer: load_bank_tensor(self.bank_dir, layer, device)
+                layer: load_bank_tensor(self.bank_dir, layer, device, normalize=use_cosine)
                 for layer in self.layers
             }
 
@@ -114,10 +136,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max_new_tokens", type=int, default=32)
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--normalize_queries", action="store_true")
-    p.add_argument("--normalize_bank", action="store_true", help="Set this if bank was L2-normalized.")
+    p.add_argument(
+        "--normalize_bank",
+        action="store_true",
+        help="Normalize bank vectors at probe time for cosine retrieval. Raw bank tensors stay unnormalized on disk.",
+    )
     p.add_argument("--collect_attention_stats", action="store_true")
     p.add_argument("--topk_true_rank", type=int, default=10)
-    p.add_argument("--use_faiss", action="store_true", help="Use saved FAISS indices if present, otherwise build in-memory FAISS from tensors.")
+    p.add_argument(
+        "--use_faiss",
+        action="store_true",
+        help="Use saved FAISS indices when their recorded metric matches, otherwise rebuild an in-memory index from raw bank tensors.",
+    )
     p.add_argument("--prompt_format", type=str, default="raw", choices=["raw", "chat"])
     p.add_argument("--add_generation_prompt", action="store_true", help="For chat prompts, append assistant-generation marker in the template.")
     p.add_argument("--trust_remote_code", action="store_true")

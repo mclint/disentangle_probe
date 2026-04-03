@@ -391,6 +391,99 @@ class ContextualBankTests(unittest.TestCase):
             self.assertGreater(float(stats_payload["variance"][row].abs().sum().item()), 0.0)
             self.assertEqual(int(codebook_payload["cluster_counts"][row].sum().item()), int(stats_payload["counts"][row].item()))
 
+    def test_normalized_contextual_bank_records_state_space_and_changes_payloads(self):
+        tokenizer = TinyTokenizer()
+        model = TinyModel()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            dataset_path = tmp_path / "dataset.jsonl"
+            dataset_path.write_text(
+                json.dumps({"messages": [{"role": "user", "content": "ab"}, {"role": "assistant", "content": "cb"}]}) + "\n"
+                + json.dumps({"messages": [{"role": "user", "content": "xb"}, {"role": "assistant", "content": "yb"}]}) + "\n",
+                encoding="utf-8",
+            )
+            config_path = tmp_path / "distributions.json"
+            config_path.write_text(
+                json.dumps({
+                    "distributions": [
+                        {
+                            "name": "content_only",
+                            "include_content_tokens": True,
+                            "include_template_control_tokens": False,
+                            "include_special_tokens": False,
+                        }
+                    ]
+                }),
+                encoding="utf-8",
+            )
+            raw_out_dir = tmp_path / "artifacts_raw"
+            norm_out_dir = tmp_path / "artifacts_norm"
+
+            raw_args = Namespace(
+                model="tiny-model",
+                dataset_file=str(dataset_path),
+                hf_dataset=None,
+                hf_split="train",
+                hf_revision=None,
+                hf_streaming=False,
+                distribution_config=str(config_path),
+                out_dir=str(raw_out_dir),
+                layers=[0, 1, 2],
+                device="cpu",
+                dtype="float32",
+                max_examples=None,
+                max_prompt_tokens=256,
+                batch_size=2,
+                normalize_states=False,
+                codebook_k=2,
+                codebook_min_count=2,
+                trust_remote_code=False,
+                attn_implementation=None,
+            )
+            norm_args = Namespace(
+                model="tiny-model",
+                dataset_file=str(dataset_path),
+                hf_dataset=None,
+                hf_split="train",
+                hf_revision=None,
+                hf_streaming=False,
+                distribution_config=str(config_path),
+                out_dir=str(norm_out_dir),
+                layers=[0, 1, 2],
+                device="cpu",
+                dtype="float32",
+                max_examples=None,
+                max_prompt_tokens=256,
+                batch_size=2,
+                normalize_states=True,
+                codebook_k=2,
+                codebook_min_count=2,
+                trust_remote_code=False,
+                attn_implementation=None,
+            )
+
+            with patch("build_contextual_bank.load_model_and_tokenizer", return_value=(model, tokenizer)):
+                build_contextual_bank.run_contextual_bank(raw_args)
+            with patch("build_contextual_bank.load_model_and_tokenizer", return_value=(model, tokenizer)):
+                build_contextual_bank.run_contextual_bank(norm_args)
+
+            raw_meta = json.loads((raw_out_dir / "meta.json").read_text(encoding="utf-8"))
+            norm_meta = json.loads((norm_out_dir / "meta.json").read_text(encoding="utf-8"))
+            self.assertEqual(raw_meta["state_space"], "raw")
+            self.assertEqual(norm_meta["state_space"], "normalized")
+            self.assertFalse(raw_meta["posthoc_normalization_supported"])
+            self.assertFalse(norm_meta["posthoc_normalization_supported"])
+
+            raw_stats = torch.load(raw_out_dir / "distribution_content_only" / "layer_1_stats.pt", map_location="cpu")
+            norm_stats = torch.load(norm_out_dir / "distribution_content_only" / "layer_1_stats.pt", map_location="cpu")
+            token_b = tokenizer._get_id("b")
+            row_raw = int((raw_stats["token_ids"] == token_b).nonzero(as_tuple=False)[0, 0].item())
+            row_norm = int((norm_stats["token_ids"] == token_b).nonzero(as_tuple=False)[0, 0].item())
+
+            self.assertTrue(torch.equal(raw_stats["counts"], norm_stats["counts"]))
+            self.assertFalse(torch.allclose(raw_stats["mean"][row_raw], norm_stats["mean"][row_norm]))
+
 
 if __name__ == "__main__":
     unittest.main()

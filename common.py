@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import random
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, TypeVar
@@ -254,6 +255,138 @@ def maybe_normalize(x: torch.Tensor, normalize: bool) -> torch.Tensor:
     return F.normalize(x, p=2, dim=-1) if normalize else x
 
 
+def split_examples_deterministically(
+    examples: Sequence[T],
+    fit_fraction: float,
+    seed: int,
+) -> Tuple[List[T], List[T]]:
+    if not 0.0 < float(fit_fraction) < 1.0:
+        raise ValueError("--fit_fraction must be strictly between 0 and 1.")
+    if len(examples) < 2:
+        raise ValueError("Need at least 2 examples to create disjoint fit/eval splits.")
+
+    indices = list(range(len(examples)))
+    random.Random(int(seed)).shuffle(indices)
+    fit_size = int(round(len(indices) * float(fit_fraction)))
+    fit_size = min(max(fit_size, 1), len(indices) - 1)
+
+    fit_indices = set(indices[:fit_size])
+    fit_examples = [examples[idx] for idx in range(len(examples)) if idx in fit_indices]
+    eval_examples = [examples[idx] for idx in range(len(examples)) if idx not in fit_indices]
+    return fit_examples, eval_examples
+
+
+def lookup_prototypes(
+    bank: torch.Tensor,
+    token_ids: Sequence[int] | torch.Tensor,
+    *,
+    device: str | torch.device | None = None,
+) -> torch.Tensor:
+    if torch.is_tensor(token_ids):
+        token_id_tensor = token_ids.detach().to(dtype=torch.long)
+    else:
+        token_id_tensor = torch.tensor(list(token_ids), dtype=torch.long)
+
+    flat_token_ids = token_id_tensor.reshape(-1).cpu()
+    gathered = bank[flat_token_ids]
+    if not torch.is_tensor(gathered):
+        gathered = torch.as_tensor(gathered)
+
+    target_device = device
+    if target_device is None:
+        target_device = token_id_tensor.device
+        if target_device.type == "cpu" and torch.is_tensor(bank):
+            target_device = bank.device
+
+    gathered = gathered.to(target_device)
+    return gathered.reshape(*token_id_tensor.shape, gathered.shape[-1])
+
+
+class ReconstructionMetricsAccumulator:
+    def __init__(
+        self,
+        *,
+        cosine_thresholds: Sequence[float],
+        mse_thresholds: Sequence[float],
+    ):
+        self.cosine_thresholds = [float(threshold) for threshold in cosine_thresholds]
+        self.mse_thresholds = [float(threshold) for threshold in mse_thresholds]
+        self.count = 0
+        self.hidden_size: Optional[int] = None
+        self.target_sum: Optional[torch.Tensor] = None
+        self.target_sq_sum = 0.0
+        self.squared_error_sum = 0.0
+        self.cosine_sum = 0.0
+        self.cosine_values: List[float] = []
+        self.cosine_coverage_counts = {float(threshold): 0 for threshold in self.cosine_thresholds}
+        self.mse_coverage_counts = {float(threshold): 0 for threshold in self.mse_thresholds}
+
+    def update(self, targets: torch.Tensor, reconstructions: torch.Tensor) -> None:
+        if targets.ndim != 2 or reconstructions.ndim != 2:
+            raise ValueError("Expected [num_tokens, hidden_size] tensors for reconstruction metrics.")
+        if targets.shape != reconstructions.shape:
+            raise ValueError("targets and reconstructions must have identical shape.")
+        if targets.numel() == 0:
+            return
+
+        targets_cpu = targets.detach().to(torch.float32).cpu()
+        recon_cpu = reconstructions.detach().to(torch.float32).cpu()
+        if self.hidden_size is None:
+            self.hidden_size = int(targets_cpu.shape[-1])
+            self.target_sum = torch.zeros(self.hidden_size, dtype=torch.float64)
+
+        cosine = F.cosine_similarity(targets_cpu, recon_cpu, dim=-1, eps=1e-12)
+        squared_error = torch.square(targets_cpu - recon_cpu)
+        mse_per_token = squared_error.mean(dim=-1)
+
+        self.count += int(targets_cpu.shape[0])
+        self.target_sum = self.target_sum + targets_cpu.sum(dim=0, dtype=torch.float64)
+        self.target_sq_sum += float(torch.square(targets_cpu).sum().item())
+        self.squared_error_sum += float(squared_error.sum().item())
+        self.cosine_sum += float(cosine.sum().item())
+        self.cosine_values.extend(float(value) for value in cosine.tolist())
+
+        for threshold in self.cosine_thresholds:
+            self.cosine_coverage_counts[threshold] += int((cosine >= threshold).sum().item())
+        for threshold in self.mse_thresholds:
+            self.mse_coverage_counts[threshold] += int((mse_per_token <= threshold).sum().item())
+
+    def finalize(self) -> Dict[str, Any]:
+        if self.count == 0 or self.hidden_size is None or self.target_sum is None:
+            return {
+                "token_count": 0,
+                "cosine_mean": None,
+                "cosine_median": None,
+                "mse_mean_per_dim": None,
+                "explained_variance": None,
+                "coverage_cosine": {f"{threshold:g}": None for threshold in self.cosine_thresholds},
+                "coverage_mse_per_dim": {f"{threshold:g}": None for threshold in self.mse_thresholds},
+            }
+
+        target_mean = self.target_sum / float(self.count)
+        total_variance_sum = self.target_sq_sum - float(self.count) * float(torch.square(target_mean).sum().item())
+        if total_variance_sum <= 1e-12:
+            explained_variance = 1.0 if self.squared_error_sum <= 1e-12 else 0.0
+        else:
+            explained_variance = 1.0 - (self.squared_error_sum / total_variance_sum)
+
+        return {
+            "token_count": int(self.count),
+            "cosine_mean": float(self.cosine_sum / float(self.count)),
+            "cosine_median": float(np.median(np.asarray(self.cosine_values, dtype=np.float32))),
+            "mse_mean_per_dim": float(self.squared_error_sum / float(self.count * self.hidden_size)),
+            "explained_variance": float(explained_variance),
+            "coverage_cosine": {
+                f"{threshold:g}": float(self.cosine_coverage_counts[threshold] / float(self.count))
+                for threshold in self.cosine_thresholds
+            },
+            "coverage_mse_per_dim": {
+                f"{threshold:g}": float(self.mse_coverage_counts[threshold] / float(self.count))
+                for threshold in self.mse_thresholds
+            },
+        }
+
+
 def to_numpy_f32(x: torch.Tensor) -> np.ndarray:
     return x.detach().to(torch.float32).cpu().contiguous().numpy().astype("float32", copy=False)
 
@@ -465,17 +598,38 @@ def bank_metadata_path(bank_dir: str | Path) -> Path:
     return Path(bank_dir) / "bank_meta.json"
 
 
+def faiss_metric_name(use_cosine: bool) -> str:
+    return "cosine" if use_cosine else "l2"
+
+
+def _validate_tensor_storage(value: str) -> str:
+    if value != "raw":
+        raise ValueError(f"Unsupported tensor storage mode: {value}")
+    return value
+
+
+def _validate_faiss_metric(value: str | None) -> str | None:
+    if value not in {None, "l2", "cosine"}:
+        raise ValueError(f"Unsupported FAISS metric: {value}")
+    return value
+
+
 def save_bank_metadata(
     bank_dir: str | Path,
     vocab_size: int,
     hidden_size: int,
     dtype: torch.dtype,
     layers: Sequence[int],
+    *,
+    tensor_storage: str = "raw",
+    faiss_metric: str | None = None,
 ) -> None:
     payload = {
         "shape": [int(vocab_size), int(hidden_size)],
         "dtype": dtype_name(dtype),
         "layers": [int(layer) for layer in layers],
+        "tensor_storage": _validate_tensor_storage(tensor_storage),
+        "faiss_metric": _validate_faiss_metric(faiss_metric),
     }
     bank_metadata_path(bank_dir).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
@@ -484,7 +638,24 @@ def load_bank_metadata(bank_dir: str | Path) -> Dict[str, Any]:
     path = bank_metadata_path(bank_dir)
     if not path.exists():
         raise FileNotFoundError(f"Activation bank metadata not found at {path}")
-    return json.loads(path.read_text(encoding="utf-8"))
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["tensor_storage"] = _validate_tensor_storage(str(payload.get("tensor_storage", "raw")))
+    payload["faiss_metric"] = _validate_faiss_metric(payload.get("faiss_metric"))
+    return payload
+
+
+def try_load_bank_metadata(bank_dir: str | Path) -> Optional[Dict[str, Any]]:
+    path = bank_metadata_path(bank_dir)
+    if not path.exists():
+        return None
+    return load_bank_metadata(bank_dir)
+
+
+def saved_faiss_metric(bank_dir: str | Path) -> str | None:
+    metadata = try_load_bank_metadata(bank_dir)
+    if metadata is None:
+        return None
+    return _validate_faiss_metric(metadata.get("faiss_metric"))
 
 
 def resolve_bank_path(bank_dir: str | Path, layer: int) -> Path:
@@ -500,7 +671,13 @@ def resolve_bank_path(bank_dir: str | Path, layer: int) -> Path:
     return memmap_path
 
 
-def load_bank_tensor(bank_dir: str | Path, layer: int, device: str) -> torch.Tensor:
+def load_bank_tensor(
+    bank_dir: str | Path,
+    layer: int,
+    device: str,
+    *,
+    normalize: bool = False,
+) -> torch.Tensor:
     path = resolve_bank_path(bank_dir, layer)
     if not path.exists():
         raise FileNotFoundError(f"Activation bank for layer {layer} not found under {bank_dir}")
@@ -513,11 +690,15 @@ def load_bank_tensor(bank_dir: str | Path, layer: int, device: str) -> torch.Ten
             dtype=get_dtype(metadata["dtype"]),
             shape=torch.Size(metadata["shape"]),
         )
-        return tensor.to(device)
-    if path.suffix == ".npy":
+        loaded = tensor.to(device)
+    elif path.suffix == ".npy":
         array = np.load(path)
-        return torch.from_numpy(array).to(device)
-    return torch.load(path, map_location=device)
+        loaded = torch.from_numpy(array).to(device)
+    else:
+        loaded = torch.load(path, map_location=device)
+    if normalize:
+        return maybe_normalize(loaded.to(torch.float32), normalize=True)
+    return loaded
 
 
 def load_bank_vectors_for_faiss(bank_dir: str | Path, layer: int) -> np.ndarray | torch.Tensor:
@@ -571,6 +752,10 @@ def build_faiss_index(vectors: np.ndarray | torch.Tensor, use_cosine: bool, add_
             batch = to_numpy_f32(batch_vectors)
         else:
             batch = np.asarray(batch_vectors, dtype="float32")
+        if use_cosine:
+            norms = np.linalg.norm(batch, axis=1, keepdims=True)
+            norms = np.clip(norms, a_min=1e-12, a_max=None)
+            batch = batch / norms
         index.add(batch)
     return index
 
@@ -582,13 +767,14 @@ def knn_top1_and_true_rank(
     use_cosine: bool,
     topk_true_rank: int,
 ) -> Tuple[int, float, Optional[int]]:
+    query_for_bank = query.to(bank.dtype) if query.dtype != bank.dtype else query
     if use_cosine:
-        sims = bank @ query
+        sims = bank @ query_for_bank
         top_scores, top_ids = torch.topk(sims, k=max(1, topk_true_rank), dim=0)
         nn_id = int(top_ids[0].item())
         score = float(top_scores[0].item())
     else:
-        dists = torch.sum((bank - query.unsqueeze(0)) ** 2, dim=-1)
+        dists = torch.sum((bank - query_for_bank.unsqueeze(0)) ** 2, dim=-1)
         top_scores, top_ids = torch.topk(-dists, k=max(1, topk_true_rank), dim=0)
         nn_id = int(top_ids[0].item())
         score = float(top_scores[0].item())
@@ -790,17 +976,30 @@ def print_summary(records: Sequence[ProbeRecord]) -> None:
     if not records:
         print("No records.")
         return
-    grouped: Dict[Tuple[str, int, bool, bool], List[ProbeRecord]] = {}
+    def _print_grouped_summary(
+        title: str,
+        grouped_records: Dict[Tuple[str, int, bool, bool], List[ProbeRecord]],
+    ) -> None:
+        print(f"\n=== {title} ===")
+        for (phase, layer, is_special, is_template), rs in sorted(
+            grouped_records.items(),
+            key=lambda x: (x[0][0], x[0][1], x[0][2], x[0][3]),
+        ):
+            n = len(rs)
+            disent = sum(int(r.disentangled) for r in rs)
+            mean_score = sum(r.score for r in rs) / max(1, n)
+            tok_label = "special" if is_special else "non_special"
+            template_label = "template" if is_template else "content_or_decode"
+            print(
+                f"phase={phase:8s} layer={layer:3d} tokens={tok_label:11s} source={template_label:17s} "
+                f"n={n:6d} disentangled_rate={disent/max(1,n):.4f} mean_score={mean_score:.4f}"
+            )
+
+    grouped_by_phase: Dict[Tuple[str, int, bool, bool], List[ProbeRecord]] = {}
+    grouped_combined: Dict[Tuple[str, int, bool, bool], List[ProbeRecord]] = {}
     for r in records:
-        grouped.setdefault((r.phase, r.layer, r.is_special_token, r.is_template_control_token), []).append(r)
-    print("\n=== Summary ===")
-    for (phase, layer, is_special, is_template), rs in sorted(grouped.items(), key=lambda x: (x[0][0], x[0][1], x[0][2], x[0][3])):
-        n = len(rs)
-        disent = sum(int(r.disentangled) for r in rs)
-        mean_score = sum(r.score for r in rs) / max(1, n)
-        tok_label = "special" if is_special else "non_special"
-        template_label = "template" if is_template else "content_or_decode"
-        print(
-            f"phase={phase:7s} layer={layer:3d} tokens={tok_label:11s} source={template_label:17s} "
-            f"n={n:6d} disentangled_rate={disent/max(1,n):.4f} mean_score={mean_score:.4f}"
-        )
+        grouped_by_phase.setdefault((r.phase, r.layer, r.is_special_token, r.is_template_control_token), []).append(r)
+        grouped_combined.setdefault(("combined", r.layer, r.is_special_token, r.is_template_control_token), []).append(r)
+
+    _print_grouped_summary("Summary", grouped_by_phase)
+    _print_grouped_summary("Combined Summary", grouped_combined)

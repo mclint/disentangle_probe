@@ -9,13 +9,13 @@ This package measures **hidden-state disentanglement** in Hugging Face causal LM
 
 ## Key files
 
-- `build_bank.py` — builds per-layer activation bank (.pt tensors + .faiss indices)
+- `build_bank.py` — builds per-layer activation bank (raw `.memmap` tensors + optional `.faiss` indices)
 - `build_contextual_bank.py` — builds sparse contextualized token stats and codebooks from chat datasets
 - `probe_states.py` — probes prefill/decode states against the bank (standard attention models)
 - `probe_states_hybrid.py` — same as above but handles hybrid attention (e.g. Qwen 3.5 with mixed full/linear attention layers)
 - `common.py` — shared utilities: model loading, FAISS wrappers, prompt preparation, attention summarisation, output writing
 - `configs/` — example distribution configs for contextualized-bank runs
-- `analyze_results.ipynb` — analysis and visualisation notebook
+- `notebooks/` — analysis/debug notebooks, including `analyze_results.ipynb`, `debug.ipynb`, and `context_bank_diagnostics.ipynb`
 
 ## Layer convention (HuggingFace hidden_states indexing)
 
@@ -76,8 +76,11 @@ When changing CLI flags, output schema, or adding new scripts, update both `READ
 
 ## Common flags
 
-- `--normalize_bank` + `--normalize_queries`: use cosine similarity (both must be set)
-- `--use_faiss`: use .faiss index files for fast NN search
+- `--normalize_bank` in `build_bank.py`: build cosine-compatible `.faiss` indices while keeping bank tensors raw on disk
+- `--normalize_bank` + `--normalize_queries`: use cosine similarity in probing by normalizing raw bank vectors at probe time
+- `--normalize_bank` + `--normalize_states`: use cosine-space prototypes in `evaluate_residuals.py`
+- `--normalize_states` in `build_contextual_bank.py`: aggregate normalized hidden states directly; contextual sparse stats/codebooks are therefore stored in normalized space and cannot be post-hoc converted from raw aggregates
+- `--use_faiss`: reuse saved `.faiss` only when its recorded metric matches, otherwise rebuild from raw bank tensors
 - `--collect_attention_stats`: extract attention entropy, top-k mass, recency, BOS mass, etc.
 - `--prompt_format chat` + `--add_generation_prompt`: for chat-templated prompts (JSONL input)
 - `--trust_remote_code`: required for some model architectures

@@ -11,14 +11,13 @@ from tensordict import MemoryMappedTensor
 
 from common import (
     bank_memmap_path,
-    bank_metadata_path,
     batch_iter,
     build_faiss_index,
     ensure_dir,
+    faiss_metric_name,
     get_dtype,
     hidden_size_from_model,
     load_model_and_tokenizer,
-    maybe_normalize,
     save_bank_metadata,
     validate_layers,
     num_hidden_state_slots,
@@ -56,6 +55,8 @@ class ActivationBank:
         self.layers = list(layers)
         self.dtype = dtype
         self.bank_arrays: Dict[int, torch.Tensor] = {}
+        self.vocab_size: int | None = None
+        self.hidden_size: int | None = None
 
     def bank_path(self, layer: int) -> Path:
         return bank_memmap_path(self.bank_dir, layer)
@@ -65,7 +66,17 @@ class ActivationBank:
 
     def initialize(self, vocab_size: int, d_model: int) -> None:
         ensure_dir(self.bank_dir)
-        save_bank_metadata(self.bank_dir, vocab_size, d_model, self.dtype, self.layers)
+        self.vocab_size = int(vocab_size)
+        self.hidden_size = int(d_model)
+        save_bank_metadata(
+            self.bank_dir,
+            vocab_size,
+            d_model,
+            self.dtype,
+            self.layers,
+            tensor_storage="raw",
+            faiss_metric=None,
+        )
         self.bank_arrays = {
             layer: MemoryMappedTensor.empty(
                 (vocab_size, d_model),
@@ -88,9 +99,17 @@ class ActivationBank:
                 path = self.bank_path(layer)
                 if path.exists():
                     path.unlink()
-            meta_path = bank_metadata_path(self.bank_dir)
-            if meta_path.exists():
-                meta_path.unlink()
+        if self.vocab_size is None or self.hidden_size is None:
+            raise ValueError("ActivationBank.save() called before initialize().")
+        save_bank_metadata(
+            self.bank_dir,
+            self.vocab_size,
+            self.hidden_size,
+            self.dtype,
+            self.layers,
+            tensor_storage="raw",
+            faiss_metric=faiss_metric_name(use_cosine) if save_faiss else None,
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -105,9 +124,13 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--bank_dir", type=str, required=True)
     p.add_argument("--device", type=str, default="cuda")
-    p.add_argument("--dtype", type=str, default="float16", choices=["float16", "bfloat16", "float32"])
+    p.add_argument("--dtype", type=str, default="bfloat16", choices=["float16", "bfloat16", "float32"])
     p.add_argument("--vocab_batch_size", type=int, default=256)
-    p.add_argument("--normalize_bank", action="store_true")
+    p.add_argument(
+        "--normalize_bank",
+        action="store_true",
+        help="Build cosine-compatible FAISS indices. Raw bank tensors are always stored unnormalized.",
+    )
     p.add_argument("--skip_save_tensors", action="store_true", help="Save only FAISS indices and not the raw bank tensors.")
     p.add_argument("--skip_save_faiss", action="store_true", help="Save only raw bank tensors and not FAISS indices.")
     p.add_argument("--trust_remote_code", action="store_true")
@@ -167,7 +190,6 @@ def main() -> None:
             vecs = outputs.hidden_states[layer][:, 1, :]
             # if layer > 0:
             #     vecs -= outputs.hidden_states[layer-1][:, 0, :]
-            vecs = maybe_normalize(vecs, args.normalize_bank)
             bank.bank_arrays[layer][ids] = vecs.to(bank_dtype).cpu()
 
     bank.save(

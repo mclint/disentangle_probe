@@ -63,14 +63,21 @@ def parse_args() -> argparse.Namespace:
         help="HF hidden_states indices to use. If omitted, use all layers including embeddings.",
     )
     p.add_argument("--device", type=str, default="cuda")
-    p.add_argument("--dtype", type=str, default="float16", choices=["float16", "bfloat16", "float32"])
+    p.add_argument("--dtype", type=str, default="bfloat16", choices=["float16", "bfloat16", "float32"])
     p.add_argument("--max_examples", type=int, default=None)
     p.add_argument("--max_prompt_tokens", type=int, default=512)
     p.add_argument("--batch_size", type=int, default=4)
     p.add_argument("--hf_split", type=str, default="train")
     p.add_argument("--hf_revision", type=str, default=None)
     p.add_argument("--hf_streaming", action="store_true")
-    p.add_argument("--normalize_states", action="store_true")
+    p.add_argument(
+        "--normalize_states",
+        action="store_true",
+        help=(
+            "Normalize hidden states before aggregation. This changes the stored contextual "
+            "stats/codebooks directly and cannot be deferred until load time."
+        ),
+    )
     p.add_argument("--codebook_k", type=int, default=8)
     p.add_argument("--codebook_min_count", type=int, default=8)
     p.add_argument("--trust_remote_code", action="store_true")
@@ -220,6 +227,8 @@ def run_contextual_bank(args: argparse.Namespace) -> None:
 
     d_model = hidden_size_from_model(model)
     storage_dtype = get_dtype(args.dtype)
+    state_space = "normalized" if args.normalize_states else "raw"
+    print(f"Contextual artifact state space: {state_space}")
 
     distribution_masks = [
         {spec.name: build_distribution_token_mask(example, tokenizer, spec) for spec in distributions}
@@ -285,6 +294,8 @@ def run_contextual_bank(args: argparse.Namespace) -> None:
         "dataset_split": dataset_meta["dataset_split"],
         "dataset_revision": dataset_meta["dataset_revision"],
         "normalize_states": bool(args.normalize_states),
+        "state_space": state_space,
+        "posthoc_normalization_supported": False,
         "codebook_k": int(args.codebook_k),
         "codebook_min_count": int(args.codebook_min_count),
         "max_examples": args.max_examples,
