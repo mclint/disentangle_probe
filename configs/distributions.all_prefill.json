@@ -1,0 +1,10 @@
+{
+  "distributions": [
+    {
+      "name": "all_prefill",
+      "include_content_tokens": true,
+      "include_template_control_tokens": true,
+      "include_special_tokens": false
+    }
+  ]
+}

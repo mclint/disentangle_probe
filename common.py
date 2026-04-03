@@ -3,13 +3,17 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, TypeVar
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from tensordict import MemoryMappedTensor
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+try:
+    from tensordict import MemoryMappedTensor
+except ImportError:  # pragma: no cover - exercised indirectly in environments without tensordict
+    MemoryMappedTensor = None
 
 
 @dataclass
@@ -46,6 +50,61 @@ class ProbeRecord:
     attn_bos_mass: Optional[float] = None
     attn_prev_mass: Optional[float] = None
     attn_mean_distance: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class TokenDistributionSpec:
+    name: str
+    include_content_tokens: bool
+    include_template_control_tokens: bool
+    include_special_tokens: bool = False
+
+    @classmethod
+    def from_dict(cls, obj: Dict[str, Any]) -> "TokenDistributionSpec":
+        if not isinstance(obj, dict):
+            raise ValueError("Each distribution entry must be a JSON object.")
+        name = obj.get("name")
+        if not isinstance(name, str) or not name:
+            raise ValueError("Each distribution must have a non-empty string 'name'.")
+        if not all(ch.isalnum() or ch in "._-" for ch in name):
+            raise ValueError(
+                f"Distribution name {name!r} contains unsupported characters. "
+                "Use letters, numbers, '.', '_' or '-'."
+            )
+
+        include_content_tokens = bool(obj.get("include_content_tokens", False))
+        include_template_control_tokens = bool(obj.get("include_template_control_tokens", False))
+        include_special_tokens = bool(obj.get("include_special_tokens", False))
+
+        if not (include_content_tokens or include_template_control_tokens):
+            raise ValueError(
+                f"Distribution {name!r} must enable at least one token source: "
+                "'include_content_tokens' or 'include_template_control_tokens'."
+            )
+
+        return cls(
+            name=name,
+            include_content_tokens=include_content_tokens,
+            include_template_control_tokens=include_template_control_tokens,
+            include_special_tokens=include_special_tokens,
+        )
+
+    def matches(
+        self,
+        *,
+        is_content_token: bool,
+        is_template_control_token: bool,
+        is_special_token: bool,
+    ) -> bool:
+        if is_special_token and not self.include_special_tokens:
+            return False
+        return (
+            (self.include_content_tokens and is_content_token)
+            or (self.include_template_control_tokens and is_template_control_token)
+        )
+
+
+T = TypeVar("T")
 
 
 def get_dtype(name: str) -> torch.dtype:
@@ -139,7 +198,7 @@ def validate_layers(requested_layers: Sequence[int], model) -> None:
         raise ValueError(f"Invalid layers {bad}; valid range is [0, {total - 1}].")
 
 
-def batch_iter(xs: Sequence[int], batch_size: int):
+def batch_iter(xs: Sequence[T], batch_size: int):
     for i in range(0, len(xs), batch_size):
         yield xs[i : i + batch_size]
 
@@ -153,6 +212,42 @@ def decode_token(tokenizer, token_id: int) -> str:
 
 def is_special_token_id(tokenizer, token_id: int) -> bool:
     return int(token_id) in set(getattr(tokenizer, "all_special_ids", []) or [])
+
+
+def load_distribution_specs(path: str | Path) -> List[TokenDistributionSpec]:
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("Distribution config must be a JSON object.")
+    raw_distributions = payload.get("distributions")
+    if not isinstance(raw_distributions, list) or not raw_distributions:
+        raise ValueError("Distribution config must contain a non-empty 'distributions' list.")
+
+    specs = [TokenDistributionSpec.from_dict(obj) for obj in raw_distributions]
+    names = [spec.name for spec in specs]
+    duplicates = sorted({name for name in names if names.count(name) > 1})
+    if duplicates:
+        raise ValueError(f"Duplicate distribution names found: {duplicates}")
+    return specs
+
+
+def build_distribution_token_mask(
+    example: PromptExample,
+    tokenizer,
+    distribution: TokenDistributionSpec,
+) -> List[bool]:
+    input_ids = list(example.input_ids or [])
+    content_mask = list(example.content_token_mask or [])
+    template_mask = list(example.template_control_token_mask or [])
+    mask: List[bool] = []
+    for pos, token_id in enumerate(input_ids):
+        is_content_token = bool(content_mask[pos]) if pos < len(content_mask) else False
+        is_template_control_token = bool(template_mask[pos]) if pos < len(template_mask) else False
+        mask.append(distribution.matches(
+            is_content_token=is_content_token,
+            is_template_control_token=is_template_control_token,
+            is_special_token=is_special_token_id(tokenizer, token_id),
+        ))
+    return mask
 
 
 def maybe_normalize(x: torch.Tensor, normalize: bool) -> torch.Tensor:
@@ -172,6 +267,186 @@ def dtype_name(dtype: torch.dtype) -> str:
     if dtype not in mapping:
         raise ValueError(f"Unsupported dtype: {dtype}")
     return mapping[dtype]
+
+
+class RunningMoments:
+    def __init__(self, hidden_size: int):
+        self.count = 0
+        self.mean = torch.zeros(hidden_size, dtype=torch.float32)
+        self.m2 = torch.zeros(hidden_size, dtype=torch.float32)
+
+    def update(self, vector: torch.Tensor) -> None:
+        x = vector.detach().to(torch.float32).cpu()
+        self.count += 1
+        delta = x - self.mean
+        self.mean += delta / float(self.count)
+        delta2 = x - self.mean
+        self.m2 += delta * delta2
+
+    def variance(self) -> torch.Tensor:
+        if self.count <= 0:
+            return torch.zeros_like(self.mean)
+        return self.m2 / float(self.count)
+
+
+class SparseTokenStatsAccumulator:
+    def __init__(self, hidden_size: int):
+        self.hidden_size = int(hidden_size)
+        self._states: Dict[int, RunningMoments] = {}
+
+    def update(self, token_id: int, vector: torch.Tensor) -> None:
+        token_id = int(token_id)
+        state = self._states.get(token_id)
+        if state is None:
+            state = RunningMoments(self.hidden_size)
+            self._states[token_id] = state
+        state.update(vector)
+
+    def get_state(self, token_id: int) -> Optional[RunningMoments]:
+        return self._states.get(int(token_id))
+
+    def token_ids(self) -> List[int]:
+        return sorted(self._states)
+
+    def finalize(self, storage_dtype: torch.dtype) -> Dict[str, torch.Tensor]:
+        token_ids = self.token_ids()
+        if not token_ids:
+            return {
+                "token_ids": torch.empty(0, dtype=torch.long),
+                "counts": torch.empty(0, dtype=torch.long),
+                "mean": torch.empty((0, self.hidden_size), dtype=storage_dtype),
+                "variance": torch.empty((0, self.hidden_size), dtype=storage_dtype),
+            }
+
+        counts = torch.tensor([self._states[token_id].count for token_id in token_ids], dtype=torch.long)
+        mean = torch.stack([self._states[token_id].mean for token_id in token_ids], dim=0).to(storage_dtype)
+        variance = torch.stack([self._states[token_id].variance() for token_id in token_ids], dim=0).to(storage_dtype)
+        return {
+            "token_ids": torch.tensor(token_ids, dtype=torch.long),
+            "counts": counts,
+            "mean": mean,
+            "variance": variance,
+        }
+
+
+class TokenCodebookState:
+    def __init__(self, hidden_size: int, k: int):
+        self.hidden_size = int(hidden_size)
+        self.k = int(k)
+        self.active_clusters = 0
+        self.cluster_counts = torch.zeros(self.k, dtype=torch.long)
+        self.centroids = torch.zeros((self.k, self.hidden_size), dtype=torch.float32)
+        self.m2 = torch.zeros((self.k, self.hidden_size), dtype=torch.float32)
+
+    def update(self, vector: torch.Tensor) -> None:
+        x = vector.detach().to(torch.float32).cpu()
+        if self.active_clusters == 0:
+            self._assign_new_cluster(0, x)
+            self.active_clusters = 1
+            return
+
+        active_centroids = self.centroids[: self.active_clusters]
+        distances = torch.sum((active_centroids - x.unsqueeze(0)) ** 2, dim=-1)
+        nearest_idx = int(torch.argmin(distances).item())
+
+        if self.active_clusters < self.k and float(distances[nearest_idx].item()) > 1e-12:
+            new_idx = self.active_clusters
+            self._assign_new_cluster(new_idx, x)
+            self.active_clusters += 1
+            return
+
+        self._update_cluster(nearest_idx, x)
+
+    def _assign_new_cluster(self, cluster_idx: int, vector: torch.Tensor) -> None:
+        self.cluster_counts[cluster_idx] = 1
+        self.centroids[cluster_idx] = vector
+        self.m2[cluster_idx].zero_()
+
+    def _update_cluster(self, cluster_idx: int, vector: torch.Tensor) -> None:
+        prev_count = int(self.cluster_counts[cluster_idx].item())
+        if prev_count == 0:
+            self._assign_new_cluster(cluster_idx, vector)
+            return
+
+        next_count = prev_count + 1
+        centroid = self.centroids[cluster_idx]
+        delta = vector - centroid
+        centroid = centroid + (delta / float(next_count))
+        delta2 = vector - centroid
+        self.centroids[cluster_idx] = centroid
+        self.m2[cluster_idx] += delta * delta2
+        self.cluster_counts[cluster_idx] = next_count
+
+    def variances(self) -> torch.Tensor:
+        variances = torch.zeros_like(self.centroids)
+        for idx in range(self.active_clusters):
+            count = int(self.cluster_counts[idx].item())
+            if count > 0:
+                variances[idx] = self.m2[idx] / float(count)
+        return variances
+
+
+class SparseTokenCodebookAccumulator:
+    def __init__(self, hidden_size: int, k: int):
+        self.hidden_size = int(hidden_size)
+        self.k = int(k)
+        self._states: Dict[int, TokenCodebookState] = {}
+
+    def update(self, token_id: int, vector: torch.Tensor) -> None:
+        token_id = int(token_id)
+        state = self._states.get(token_id)
+        if state is None:
+            state = TokenCodebookState(self.hidden_size, self.k)
+            self._states[token_id] = state
+        state.update(vector)
+
+    def finalize(
+        self,
+        storage_dtype: torch.dtype,
+        stats_accumulator: SparseTokenStatsAccumulator,
+        min_count: int,
+    ) -> Dict[str, torch.Tensor]:
+        token_ids = stats_accumulator.token_ids()
+        if not token_ids:
+            return {
+                "token_ids": torch.empty(0, dtype=torch.long),
+                "active_clusters": torch.empty(0, dtype=torch.long),
+                "cluster_counts": torch.empty((0, self.k), dtype=torch.long),
+                "centroids": torch.empty((0, self.k, self.hidden_size), dtype=storage_dtype),
+                "cluster_variance": torch.empty((0, self.k, self.hidden_size), dtype=storage_dtype),
+            }
+
+        active_clusters = torch.zeros(len(token_ids), dtype=torch.long)
+        cluster_counts = torch.zeros((len(token_ids), self.k), dtype=torch.long)
+        centroids = torch.zeros((len(token_ids), self.k, self.hidden_size), dtype=torch.float32)
+        cluster_variance = torch.zeros((len(token_ids), self.k, self.hidden_size), dtype=torch.float32)
+
+        for row, token_id in enumerate(token_ids):
+            stats_state = stats_accumulator.get_state(token_id)
+            codebook_state = self._states.get(token_id)
+            if stats_state is None:
+                continue
+
+            total_count = int(stats_state.count)
+            if total_count < int(min_count) or codebook_state is None or codebook_state.active_clusters == 0:
+                active_clusters[row] = 1 if total_count > 0 else 0
+                cluster_counts[row, 0] = total_count
+                centroids[row, 0] = stats_state.mean
+                cluster_variance[row, 0] = stats_state.variance()
+                continue
+
+            active_clusters[row] = int(codebook_state.active_clusters)
+            cluster_counts[row] = codebook_state.cluster_counts
+            centroids[row] = codebook_state.centroids
+            cluster_variance[row] = codebook_state.variances()
+
+        return {
+            "token_ids": torch.tensor(token_ids, dtype=torch.long),
+            "active_clusters": active_clusters,
+            "cluster_counts": cluster_counts,
+            "centroids": centroids.to(storage_dtype),
+            "cluster_variance": cluster_variance.to(storage_dtype),
+        }
 
 
 def bank_memmap_path(bank_dir: str | Path, layer: int) -> Path:
@@ -230,6 +505,8 @@ def load_bank_tensor(bank_dir: str | Path, layer: int, device: str) -> torch.Ten
     if not path.exists():
         raise FileNotFoundError(f"Activation bank for layer {layer} not found under {bank_dir}")
     if path.suffix == ".memmap":
+        if MemoryMappedTensor is None:
+            raise ImportError("tensordict is required to read .memmap activation banks.")
         metadata = load_bank_metadata(bank_dir)
         tensor = MemoryMappedTensor.from_filename(
             path,
@@ -248,6 +525,8 @@ def load_bank_vectors_for_faiss(bank_dir: str | Path, layer: int) -> np.ndarray 
     if not path.exists():
         raise FileNotFoundError(f"Activation bank for layer {layer} not found under {bank_dir}")
     if path.suffix == ".memmap":
+        if MemoryMappedTensor is None:
+            raise ImportError("tensordict is required to read .memmap activation banks.")
         metadata = load_bank_metadata(bank_dir)
         return MemoryMappedTensor.from_filename(
             path,
@@ -402,6 +681,67 @@ def parse_chat_messages(obj: Any) -> List[Dict[str, Any]]:
     return normalized
 
 
+def prepare_chat_prompt_example(
+    obj: Any,
+    tokenizer,
+    max_prompt_tokens: int,
+    add_generation_prompt: bool,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> PromptExample:
+    if not hasattr(tokenizer, "apply_chat_template"):
+        raise ValueError("Selected chat prompt processing but tokenizer has no apply_chat_template().")
+
+    messages = parse_chat_messages(obj)
+    rendered_text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=add_generation_prompt,
+    )
+    input_ids, offsets = _tokenize_with_offsets(tokenizer, rendered_text)
+    if len(input_ids) > max_prompt_tokens:
+        input_ids = input_ids[:max_prompt_tokens]
+        offsets = offsets[:max_prompt_tokens]
+    content_mask = _build_content_mask_from_offsets(rendered_text, offsets, messages)
+    content_mask = content_mask[: len(input_ids)]
+    template_mask = [not x for x in content_mask]
+    example_metadata = {"prompt_format": "chat", "messages": messages}
+    if metadata:
+        example_metadata.update(metadata)
+    return PromptExample(
+        raw_text=rendered_text,
+        input_ids=input_ids,
+        attention_mask=[1] * len(input_ids),
+        content_token_mask=content_mask,
+        template_control_token_mask=template_mask,
+        metadata=example_metadata,
+    )
+
+
+def prepare_prompt_examples_from_chat_objects(
+    objects: Sequence[Any],
+    tokenizer,
+    max_prompts: Optional[int],
+    max_prompt_tokens: int,
+    add_generation_prompt: bool,
+    source_metadata: Optional[Dict[str, Any]] = None,
+) -> List[PromptExample]:
+    examples: List[PromptExample] = []
+    objs = list(objects)
+    if max_prompts is not None:
+        objs = objs[:max_prompts]
+    for idx, obj in enumerate(objs):
+        metadata = dict(source_metadata or {})
+        metadata["source_index"] = int(idx)
+        examples.append(prepare_chat_prompt_example(
+            obj=obj,
+            tokenizer=tokenizer,
+            max_prompt_tokens=max_prompt_tokens,
+            add_generation_prompt=add_generation_prompt,
+            metadata=metadata,
+        ))
+    return examples
+
+
 def prepare_prompt_examples(
     prompts_file: str,
     tokenizer,
@@ -436,33 +776,14 @@ def prepare_prompt_examples(
             ))
         return examples
 
-    if not hasattr(tokenizer, "apply_chat_template"):
-        raise ValueError("Selected prompt_format='chat' but tokenizer has no apply_chat_template().")
-
-    for line in lines:
-        obj = json.loads(line)
-        messages = parse_chat_messages(obj)
-        rendered_text = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=add_generation_prompt,
-        )
-        input_ids, offsets = _tokenize_with_offsets(tokenizer, rendered_text)
-        if len(input_ids) > max_prompt_tokens:
-            input_ids = input_ids[:max_prompt_tokens]
-            offsets = offsets[:max_prompt_tokens]
-        content_mask = _build_content_mask_from_offsets(rendered_text, offsets, messages)
-        content_mask = content_mask[: len(input_ids)]
-        template_mask = [not x for x in content_mask]
-        examples.append(PromptExample(
-            raw_text=rendered_text,
-            input_ids=input_ids,
-            attention_mask=[1] * len(input_ids),
-            content_token_mask=content_mask,
-            template_control_token_mask=template_mask,
-            metadata={"prompt_format": "chat", "messages": messages},
-        ))
-    return examples
+    objects = [json.loads(line) for line in lines]
+    return prepare_prompt_examples_from_chat_objects(
+        objects=objects,
+        tokenizer=tokenizer,
+        max_prompts=None,
+        max_prompt_tokens=max_prompt_tokens,
+        add_generation_prompt=add_generation_prompt,
+    )
 
 
 def print_summary(records: Sequence[ProbeRecord]) -> None:

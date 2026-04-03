@@ -1,0 +1,10 @@
+{
+  "distributions": [
+    {
+      "name": "content_only",
+      "include_content_tokens": true,
+      "include_template_control_tokens": false,
+      "include_special_tokens": false
+    }
+  ]
+}

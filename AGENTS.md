@@ -1,15 +1,20 @@
-# CLAUDE.md
+# AGENTS.md
 
 ## Project overview
 
 This package measures **hidden-state disentanglement** in Hugging Face causal LMs. For each layer, it builds a vocabulary activation bank (one vector per token) and then probes prefill/decode hidden states via nearest-neighbor lookup. A state is "disentangled" if its NN in the bank matches the true token.
 
+- For this workspace, always use the VSCode-configured Python interpreter instead of the shell default Python.
+- Follow the workspace fallback logic from `.vscode/settings.json`, which selects the project conda environment for this folder.
+
 ## Key files
 
 - `build_bank.py` — builds per-layer activation bank (.pt tensors + .faiss indices)
+- `build_contextual_bank.py` — builds sparse contextualized token stats and codebooks from chat datasets
 - `probe_states.py` — probes prefill/decode states against the bank (standard attention models)
 - `probe_states_hybrid.py` — same as above but handles hybrid attention (e.g. Qwen 3.5 with mixed full/linear attention layers)
 - `common.py` — shared utilities: model loading, FAISS wrappers, prompt preparation, attention summarisation, output writing
+- `configs/` — example distribution configs for contextualized-bank runs
 - `analyze_results.ipynb` — analysis and visualisation notebook
 
 ## Layer convention (HuggingFace hidden_states indexing)
@@ -37,6 +42,13 @@ Qwen 3.5 alternates full-attention and linear-attention (GatedDeltaNet) layers. 
 ## Running
 
 ```bash
+# Build contextualized bank from Capybara
+python build_contextual_bank.py --model Qwen/Qwen2.5-1.5B-Instruct \
+  --hf_dataset HuggingFaceH4/capybara --hf_split train_sft \
+  --distribution_config ./configs/distributions.content_only.json \
+  --out_dir ./context_bank_capybara_debug --layers 0 1 8 --max_examples 128 \
+  --batch_size 4 --codebook_k 4 --codebook_min_count 4 --normalize_states --device cuda:0
+
 # Build bank (auto-detects anchor from BOS, or override)
 python build_bank.py --model Qwen/Qwen3-4B --layers 4 8 12 16 20 24 28 32 \
   --bank_dir ./bank_qwen35_4b --vocab_batch_size 256 --normalize_bank --device cuda:0

@@ -5,6 +5,7 @@ This package measures **hidden-state disentanglement** in Hugging Face causal LM
 ## Files
 
 - `build_bank.py` — builds per-layer activation bank (`.memmap` tensors + `.faiss` indices)
+- `build_contextual_bank.py` — builds sparse per-layer contextualized token statistics and codebooks from chat datasets
 - `probe_states.py` — probes prefill/decode states against the bank (standard attention models)
 - `probe_states_hybrid.py` — same as above but handles hybrid attention (e.g. Qwen 3.5 with mixed full/linear attention layers)
 - `common.py` — shared utilities: model loading, FAISS wrappers, prompt preparation, attention summarisation, output writing
@@ -68,6 +69,111 @@ This writes:
 - `bank_meta.json` shape/dtype metadata for reopening memmapped banks
 
 Use `--skip_save_tensors` or `--skip_save_faiss` to omit either output.
+
+## Build a contextualized bank from chat datasets
+
+`build_contextual_bank.py` aggregates hidden states over observed dataset tokens instead of sweeping the vocabulary in isolation. V1 is chat-dataset-first and prefill-only.
+
+Example configs now live under `./configs/`:
+
+- `configs/distributions.content_only.json` — recommended default for dataset content tokens only
+- `configs/distributions.all_prefill.json` — content plus template-control tokens
+- `configs/distributions.compare_content_vs_template.json` — emits both `content_only` and `template_only` distributions in one run
+
+Example distribution config:
+
+```json
+{
+  "distributions": [
+    {
+      "name": "content_only",
+      "include_content_tokens": true,
+      "include_template_control_tokens": false,
+      "include_special_tokens": false
+    }
+  ]
+}
+```
+
+Then run from a local chat JSONL file:
+
+```bash
+python build_contextual_bank.py \
+  --model Qwen/Qwen2.5-1.5B-Instruct \
+  --dataset_file chat_prompts.jsonl \
+  --distribution_config ./configs/distributions.content_only.json \
+  --out_dir ./context_bank_qwen25_15b \
+  --layers 0 1 8 16 24 \
+  --batch_size 4 \
+  --codebook_k 8 \
+  --codebook_min_count 8 \
+  --normalize_states \
+  --device cuda:0
+```
+
+Or load a Hugging Face chat dataset directly. This requires `datasets` to be installed:
+
+```bash
+pip install datasets
+```
+
+Capybara debug slice:
+
+```bash
+python build_contextual_bank.py \
+  --model Qwen/Qwen2.5-1.5B-Instruct \
+  --hf_dataset HuggingFaceH4/capybara \
+  --hf_split train_sft \
+  --distribution_config ./configs/distributions.content_only.json \
+  --out_dir ./context_bank_capybara_debug \
+  --layers 0 1 8 \
+  --max_examples 128 \
+  --batch_size 4 \
+  --codebook_k 4 \
+  --codebook_min_count 4 \
+  --normalize_states \
+  --device cuda:0
+```
+
+Capybara full run:
+
+```bash
+python build_contextual_bank.py \
+  --model Qwen/Qwen2.5-1.5B-Instruct \
+  --hf_dataset HuggingFaceH4/capybara \
+  --hf_split train_sft \
+  --distribution_config ./configs/distributions.content_only.json \
+  --out_dir ./context_bank_capybara_full \
+  --layers 0 1 8 16 24 \
+  --batch_size 4 \
+  --codebook_k 8 \
+  --codebook_min_count 8 \
+  --normalize_states \
+  --device cuda:0
+```
+
+Outputs under `--out_dir`:
+
+- `meta.json`
+- `distribution_<name>/layer_<L>_stats.pt`
+- `distribution_<name>/layer_<L>_codebook.pt`
+
+`layer_<L>_stats.pt` contains sparse per-token tensors:
+
+- `token_ids` with only observed token ids, sorted
+- `counts`
+- `mean`
+- `variance`
+
+`layer_<L>_codebook.pt` contains sparse fixed-`K` token codebooks:
+
+- `token_ids`
+- `active_clusters`
+- `cluster_counts`
+- `centroids`
+- `cluster_variance`
+
+Low-support tokens still get a codebook row; when a token has fewer than `--codebook_min_count` examples, its codebook collapses to a single cluster equal to the token-level mean/variance.
 
 ## Probe raw-text prompts (standard model)
 
@@ -172,6 +278,11 @@ python probe_states_hybrid.py \
 | `--max_prompts` | Limit number of prompts to process |
 | `--anchor_token_id` | Override anchor token for `build_bank.py` (default: BOS token) |
 | `--skip_save_tensors` / `--skip_save_faiss` | Omit `.pt` or `.faiss` output in `build_bank.py` |
+| `--distribution_config` | JSON config describing named token distributions for `build_contextual_bank.py` |
+| `--dataset_file` / `--hf_dataset` | Choose exactly one contextual-bank dataset source: local chat JSONL or Hugging Face dataset |
+| `--hf_split` / `--hf_revision` / `--hf_streaming` | Hugging Face dataset source controls for `build_contextual_bank.py` |
+| `--normalize_states` | L2-normalize contextualized states before stats/codebook aggregation |
+| `--codebook_k` / `--codebook_min_count` | Control fixed-`K` codebook size and low-count fallback threshold |
 
 ## Notes
 
@@ -180,6 +291,9 @@ python probe_states_hybrid.py \
 - Probe scripts can read new raw `.memmap` bank files as well as legacy `.npy` and `.pt` bank files.
 - Attention summaries are only available for layers >= 1 (standard models) or full-attention layers (hybrid models).
 - Template-control detection is best-effort and assumes message content appears verbatim in the rendered chat template.
+- Contextualized banks are sparse over observed dataset tokens only; they do not allocate dense `[vocab, ...]` tensors.
+- `build_contextual_bank.py` currently aggregates prefill states only and is intended for chat-style instruct datasets.
+- When loading from Hugging Face, the current implementation expects rows that already expose OpenAI-style `messages` with `role` and `content` fields, as in `HuggingFaceH4/capybara`.
 
 ## Output schema
 
